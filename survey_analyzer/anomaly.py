@@ -65,6 +65,73 @@ def detect_anomalies(
     return result
 
 
+def detect_chunk_anomalies(
+    chunk: pd.DataFrame,
+    question_cols: list[str],
+    id_col: str = "respondent_id",
+    time_col: str = "duration_seconds",
+    thresholds: AnomalyThresholds = None,
+) -> list[dict]:
+    if thresholds is None:
+        thresholds = AnomalyThresholds()
+
+    anomaly_records = []
+
+    if id_col not in chunk.columns:
+        chunk = chunk.copy()
+        chunk[id_col] = range(1, len(chunk) + 1)
+
+    valid_q_cols = [c for c in question_cols if c in chunk.columns]
+
+    anomaly_records.extend(_detect_speeding(chunk, id_col, time_col, thresholds.speed_threshold_seconds))
+    anomaly_records.extend(_detect_straight_lining(chunk, id_col, valid_q_cols, thresholds.straight_line_min_cols, thresholds.straight_line_ratio))
+    anomaly_records.extend(_detect_pattern_answers(chunk, id_col, valid_q_cols, thresholds.pattern_min_cols))
+
+    if thresholds.contradiction_pairs:
+        anomaly_records.extend(_detect_contradictions(chunk, id_col, thresholds.contradiction_pairs))
+
+    return anomaly_records
+
+
+def detect_global_anomalies(
+    df: pd.DataFrame,
+    question_cols: list[str],
+    id_col: str = "respondent_id",
+    thresholds: AnomalyThresholds = None,
+) -> list[dict]:
+    if thresholds is None:
+        thresholds = AnomalyThresholds()
+
+    anomaly_records = []
+    valid_q_cols = [c for c in question_cols if c in df.columns]
+
+    anomaly_records.extend(_detect_numeric_outliers(
+        df, id_col, valid_q_cols,
+        thresholds.numeric_outlier_iqr_multiplier,
+        thresholds.numeric_outlier_min_rows,
+    ))
+
+    return anomaly_records
+
+
+def merge_anomaly_results(chunk_records: list[list[dict]], global_records: list[dict] = None) -> pd.DataFrame:
+    all_records = []
+    for records in chunk_records:
+        all_records.extend(records)
+    if global_records:
+        all_records.extend(global_records)
+
+    if not all_records:
+        logger.info("未检测到异常回答")
+        return pd.DataFrame(columns=["受访者ID", "异常类型", "异常详情"])
+
+    result = pd.DataFrame(all_records)
+    result = result.drop_duplicates(subset=["受访者ID", "异常类型", "异常详情"])
+    result = result.sort_values(["受访者ID", "异常类型"]).reset_index(drop=True)
+    logger.info("共检测到 %d 条异常记录，涉及 %d 位受访者", len(result), result["受访者ID"].nunique())
+    return result
+
+
 def _detect_speeding(
     df: pd.DataFrame,
     id_col: str,

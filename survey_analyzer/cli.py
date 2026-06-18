@@ -5,13 +5,17 @@ import os
 
 import pandas as pd
 
-from .cleaner import clean_survey_data, identify_column_types
-from .segmenter import segment_by_columns, auto_segment, get_segment_summary
-from .stats import compute_question_distribution, compute_cross_tabulation, compute_numeric_summary
-from .anomaly import detect_anomalies, get_anomaly_summary
+from .cleaner import clean_survey_data, clean_chunk, normalize_dataframe_columns, identify_column_types
+from .segmenter import segment_by_columns, auto_segment, segment_chunk, get_segment_summary, IncrementalSegmentCounter
+from .stats import (
+    compute_question_distribution, compute_cross_tabulation, compute_numeric_summary,
+    compute_chunk_counts, merge_chunk_counts, IncrementalNumericStats,
+)
+from .anomaly import detect_anomalies, detect_chunk_anomalies, detect_global_anomalies, merge_anomaly_results, get_anomaly_summary
 from .report import generate_report
 from .schema_validator import SchemaValidator, ValidationResult
 from .config import load_config, get_available_survey_types, AppConfig
+from .column_normalizer import apply_column_normalization, normalize_columns
 
 
 def setup_logging(verbose: bool = False):
@@ -37,6 +41,10 @@ def build_parser() -> argparse.ArgumentParser:
 支持的配置文件格式:
   - JSON (.json)
   - TOML (.toml, .tml)  - 需 Python 3.11+
+
+大文件处理:
+  使用 --chunk-size 参数启用分块流式处理，避免内存溢出
+  示例: survey-analyzer big_survey.csv --chunk-size 10000
 """,
     )
 
@@ -82,6 +90,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--encoding",
         default="utf-8",
         help="CSV文件编码（默认: utf-8，可设 auto 自动检测）",
+    )
+    basic_group.add_argument(
+        "--chunk-size",
+        type=int,
+        default=None,
+        help="分块读取大小（行数），启用后流式处理大文件避免内存溢出。仅在 CSV 格式下生效",
     )
 
     anomaly_group = parser.add_argument_group("异常检测阈值")
@@ -148,6 +162,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-standardize-yesno",
         action="store_true",
         help="不自动标准化 是/否 类答案",
+    )
+    cleaning_group.add_argument(
+        "--no-normalize-columns",
+        action="store_true",
+        help="不对列名进行归一化处理",
     )
 
     segment_group = parser.add_argument_group("分群配置")
@@ -293,50 +312,134 @@ def resolve_output_path(input_path: str, output: str = None) -> str:
     return f"{base}_report.xlsx"
 
 
-def run(args: argparse.Namespace):
-    setup_logging(args.verbose)
-    logger = logging.getLogger("survey_analyzer")
+def _run_chunked(args: argparse.Namespace, config: AppConfig, logger: logging.Logger):
+    logger.info("── 分块流式处理模式（每块 %d 行）──", args.chunk_size)
 
-    cli_overrides = _build_cli_overrides(args)
+    cleaned_chunks = []
+    chunk_anomaly_records = []
+    chunk_counts_list = []
+    numeric_stats = IncrementalNumericStats()
+    segment_counter = IncrementalSegmentCounter()
+    total_rows = 0
+    chunk_idx = 0
 
-    logger.info("=" * 60)
-    logger.info("问卷数据分析工具 启动")
-    logger.info("=" * 60)
+    for chunk in pd.read_csv(args.input, encoding=config.encoding, chunksize=args.chunk_size):
+        chunk_idx += 1
+        logger.info("处理第 %d 块（%d 行）...", chunk_idx, len(chunk))
 
-    if not args.skip_validation:
-        logger.info("── 前置校验: Schema 与编码检查 ──")
-        encoding_to_check = args.encoding if args.encoding else "utf-8"
-        validation = SchemaValidator.full_validation(
-            args.input,
-            encoding=encoding_to_check,
-        )
-        _print_validation_result(validation)
+        if not args.no_normalize_columns:
+            norm_result = normalize_columns(list(chunk.columns))
+            chunk = apply_column_normalization(chunk, norm_result)
 
-        if not validation.valid:
-            logger.error("数据校验未通过，已终止")
-            sys.exit(2)
+        if not args.no_auto_clean:
+            chunk = clean_chunk(chunk, config.cleaning, id_col=config.id_col)
+        total_rows += len(chunk)
 
-        encoding_to_use = validation.detected_encoding
-        has_fallback = any(w.code == "ENCODING_FALLBACK" for w in validation.warnings)
-        if args.encoding and args.encoding.lower() != "auto" and not has_fallback:
-            encoding_to_use = args.encoding
-        logger.info("使用编码: %s", encoding_to_use)
-        cli_overrides["encoding"] = encoding_to_use
+        if config.segment.segment_cols:
+            chunk = segment_chunk(chunk, config.segment.segment_cols)
+        else:
+            chunk = segment_chunk(chunk, [])
+        segment_counter.update(chunk)
+
+        if config.report.include_anomalies:
+            col_types = identify_column_types(chunk, id_col=config.id_col)
+            question_cols = col_types.get("question", [])
+            records = detect_chunk_anomalies(
+                chunk, question_cols, id_col=config.id_col,
+                time_col=config.time_col, thresholds=config.anomaly,
+            )
+            chunk_anomaly_records.append(records)
+
+        chunk_counts_list.append(compute_chunk_counts(chunk, col_types.get("question", [])))
+
+        numeric_q_cols = [c for c in col_types.get("question", []) if pd.api.types.is_numeric_dtype(chunk[c])]
+        numeric_stats.update(chunk, numeric_q_cols)
+
+        if config.report.include_raw_data:
+            cleaned_chunks.append(chunk)
+
+        if chunk_idx % 10 == 0:
+            logger.info("已处理 %d 块，累计 %d 行", chunk_idx, total_rows)
+
+    logger.info("分块读取完成，共 %d 块，%d 行", chunk_idx, total_rows)
+
+    if config.report.include_raw_data and cleaned_chunks:
+        full_df = pd.concat(cleaned_chunks, ignore_index=True)
+        if config.id_col in full_df.columns:
+            full_df = full_df.drop_duplicates(subset=[config.id_col])
+            total_rows = len(full_df)
     else:
-        logger.info("── 跳过 Schema 校验 ──")
-        encoding_to_use = args.encoding
+        full_df = None
 
-    logger.info("加载配置...")
-    config = load_config(
-        config_file=args.config,
-        survey_type=args.survey_type,
-        cli_overrides=cli_overrides,
+    col_types = identify_column_types(cleaned_chunks[0] if cleaned_chunks else pd.DataFrame(), id_col=config.id_col) if cleaned_chunks else {"id": [], "demographic": [], "question": [], "timing": [], "other": []}
+    question_cols = col_types.get("question", [])
+
+    distributions = merge_chunk_counts(chunk_counts_list, total_rows)
+
+    if full_df is not None and config.report.include_cross_tabs:
+        if "_群组" not in full_df.columns and config.segment.segment_cols:
+            full_df = segment_by_columns(full_df, config.segment.segment_cols)
+        cross_tabs = compute_cross_tabulation(full_df, question_cols)
+    else:
+        cross_tabs = {}
+
+    num_summary = numeric_stats.to_dataframe()
+    if full_df is not None and not num_summary.empty:
+        try:
+            num_summary_full = compute_numeric_summary(full_df, [c for c in question_cols if pd.api.types.is_numeric_dtype(full_df[c])])
+            if not num_summary_full.empty:
+                num_summary = num_summary_full
+        except Exception:
+            pass
+
+    global_anomaly_records = []
+    if config.report.include_anomalies and full_df is not None:
+        global_anomaly_records = detect_global_anomalies(
+            full_df, question_cols, id_col=config.id_col, thresholds=config.anomaly
+        )
+    anomaly_df = merge_anomaly_results(chunk_anomaly_records, global_anomaly_records)
+    anomaly_summary = get_anomaly_summary(anomaly_df) if config.report.include_anomalies else pd.DataFrame()
+
+    segment_summary = segment_counter.to_dataframe()
+
+    output_path = resolve_output_path(args.input, args.output)
+    generate_report(
+        output_path=output_path,
+        cleaned_df=full_df if full_df is not None else pd.DataFrame(),
+        col_types=col_types,
+        segment_summary=segment_summary,
+        distributions=distributions,
+        cross_tabs=cross_tabs,
+        anomaly_df=anomaly_df,
+        anomaly_summary=anomaly_summary,
+        numeric_summary=num_summary,
     )
-    logger.info("使用问卷类型预设: %s", config.survey_type)
 
+    logger.info("=" * 60)
+    logger.info("分析完成！报告已保存至: %s", os.path.abspath(output_path))
+    logger.info("=" * 60)
+
+    print(f"\n✅ 分析完成！报告已保存至: {os.path.abspath(output_path)}")
+    print(f"   有效受访者: {total_rows} 人（分块处理，{chunk_idx} 块）")
+    print(f"   分析题目数: {len(question_cols)} 题")
+    print(f"   问卷类型: {config.survey_type}")
+    if not anomaly_df.empty:
+        print(f"   异常回答: {anomaly_df['受访者ID'].nunique()} 位受访者需复核")
+    else:
+        print(f"   异常回答: 未检测到")
+
+
+def _run_standard(args: argparse.Namespace, config: AppConfig, logger: logging.Logger):
     logger.info("读取数据: %s", args.input)
     df = read_data(args.input, encoding=config.encoding)
     logger.info("原始数据: %d 行 × %d 列", len(df), len(df.columns))
+
+    if not args.no_normalize_columns:
+        logger.info("── 列名归一化 ──")
+        df, norm_result = normalize_dataframe_columns(df)
+        if norm_result.renamed_columns:
+            for original, canonical in norm_result.renamed_columns:
+                logger.info("  「%s」→「%s」", original, canonical)
 
     if not args.no_auto_clean:
         logger.info("── 步骤 1/5: 数据清洗 ──")
@@ -413,6 +516,60 @@ def run(args: argparse.Namespace):
         print(f"   异常回答: 未检测到")
 
 
+def run(args: argparse.Namespace):
+    setup_logging(args.verbose)
+    logger = logging.getLogger("survey_analyzer")
+
+    cli_overrides = _build_cli_overrides(args)
+
+    logger.info("=" * 60)
+    logger.info("问卷数据分析工具 启动")
+    logger.info("=" * 60)
+
+    if not args.skip_validation:
+        logger.info("── 前置校验: Schema 与编码检查 ──")
+        encoding_to_check = args.encoding if args.encoding else "utf-8"
+        validation = SchemaValidator.full_validation(
+            args.input,
+            encoding=encoding_to_check,
+        )
+        _print_validation_result(validation)
+
+        if not validation.valid:
+            logger.error("数据校验未通过，已终止")
+            sys.exit(2)
+
+        encoding_to_use = validation.detected_encoding
+        has_fallback = any(w.code == "ENCODING_FALLBACK" for w in validation.warnings)
+        if args.encoding and args.encoding.lower() != "auto" and not has_fallback:
+            encoding_to_use = args.encoding
+        logger.info("使用编码: %s", encoding_to_use)
+        cli_overrides["encoding"] = encoding_to_use
+    else:
+        logger.info("── 跳过 Schema 校验 ──")
+        encoding_to_use = args.encoding
+
+    logger.info("加载配置...")
+    config = load_config(
+        config_file=args.config,
+        survey_type=args.survey_type,
+        cli_overrides=cli_overrides,
+    )
+    logger.info("使用问卷类型预设: %s", config.survey_type)
+
+    use_chunked = (
+        args.chunk_size is not None
+        and os.path.splitext(args.input)[1].lower() == ".csv"
+    )
+
+    if use_chunked:
+        _run_chunked(args, config, logger)
+    else:
+        if args.chunk_size is not None:
+            logger.warning("--chunk-size 仅支持 CSV 格式，已忽略")
+        _run_standard(args, config, logger)
+
+
 def main():
     parser = build_parser()
     args = parser.parse_args()
@@ -435,6 +592,10 @@ def main():
         print(f"\n❌ 数据解析错误: CSV 文件格式不正确", file=sys.stderr)
         print(f"   请检查文件是否损坏，或分隔符是否正确", file=sys.stderr)
         print(f"   错误详情: {e}\n", file=sys.stderr)
+        sys.exit(1)
+    except MemoryError:
+        print(f"\n❌ 内存不足: 文件过大", file=sys.stderr)
+        print(f"   尝试使用 --chunk-size 参数启用分块处理，例如 --chunk-size 10000\n", file=sys.stderr)
         sys.exit(1)
     except KeyboardInterrupt:
         print("\n⏹️  用户中断", file=sys.stderr)

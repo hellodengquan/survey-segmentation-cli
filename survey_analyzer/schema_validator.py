@@ -2,7 +2,9 @@ import os
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Optional, Union
+from typing import Optional
+
+from .column_normalizer import normalize_column_name, normalize_columns, NormalizationResult
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +26,7 @@ class ValidationResult:
     errors: list[ValidationError] = field(default_factory=list)
     warnings: list[ValidationError] = field(default_factory=list)
     detected_encoding: str = "utf-8"
+    column_normalization: Optional[NormalizationResult] = None
 
     def __bool__(self):
         return self.valid
@@ -39,12 +42,12 @@ class SchemaValidator:
     RECOGNIZED_COLUMN_PATTERNS = {
         "respondent_id": [r"respondent[_-]?id", r"resp[_-]?id", r"受访者id", r"回答者id", r"用户id", r"user[_-]?id"],
         "duration_seconds": [r"duration", r"time[_-]?spent", r"作答时长", r"答题时间", r"用时", r"时长"],
-        "age": [r"age", r"年龄"],
-        "gender": [r"gender", r"sex", r"性别"],
-        "region": [r"region", r"city", r"province", r"地区", r"城市", r"省份"],
-        "education": [r"education", r"edu", r"学历", r"教育程度"],
-        "income": [r"income", r"salary", r"收入", r"薪资"],
-        "occupation": [r"occupation", r"job", r"职业", r"工作"],
+        "age": [r"\bage\b", r"年龄"],
+        "gender": [r"\bgender\b", r"\bsex\b", r"性别"],
+        "region": [r"\bregion\b", r"\bcity\b", r"\bprovince\b", r"地区", r"城市", r"省份"],
+        "education": [r"\beducation\b", r"\bedu\b", r"学历", r"教育程度"],
+        "income": [r"\bincome\b", r"\bsalary\b", r"收入", r"薪资"],
+        "occupation": [r"\boccupation\b", r"\bjob\b", r"职业", r"工作"],
     }
 
     QUESTION_PREFIX_PATTERNS = [r"^Q\d+", r"^q\d+", r"^\d+\.", r"^第\d+题"]
@@ -94,9 +97,29 @@ class SchemaValidator:
             else:
                 result.warnings.append(issue)
 
-        column_errors, column_warnings = cls._validate_columns(df, expected_columns)
+        column_errors, column_warnings, norm_result = cls._validate_columns(df, expected_columns)
         result.errors.extend(column_errors)
         result.warnings.extend(column_warnings)
+        result.column_normalization = norm_result
+
+        if norm_result.renamed_columns:
+            for original, canonical in norm_result.renamed_columns:
+                result.warnings.append(ValidationError(
+                    code="COLUMN_NORMALIZED",
+                    message=f"列名归一化: 「{original}」→「{canonical}」",
+                    suggestion="建议将数据源列名改为标准名称以避免歧义",
+                    severity="warning",
+                ))
+
+        if norm_result.ambiguous:
+            for canonical, originals in norm_result.ambiguous:
+                if len(originals) > 1:
+                    result.warnings.append(ValidationError(
+                        code="AMBIGUOUS_NORMALIZATION",
+                        message=f"多个列名归一化为同一标准名「{canonical}」: {', '.join('「' + o + '」' for o in originals)}",
+                        suggestion="将合并这些列的数据，建议修改列名以避免混淆",
+                        severity="warning",
+                    ))
 
         result.valid = len(result.errors) == 0
         return result
@@ -197,18 +220,28 @@ class SchemaValidator:
         cls,
         df: "pd.DataFrame",
         expected_columns: Optional[list[str]] = None,
-    ) -> tuple[list[ValidationError], list[ValidationError]]:
+    ) -> tuple[list[ValidationError], list[ValidationError], NormalizationResult]:
         errors = []
         warnings = []
         actual_columns = list(df.columns)
 
+        norm_result = normalize_columns(actual_columns)
+        normalized_to_original = {}
+        for original, canonical in norm_result.mapping.items():
+            if canonical not in normalized_to_original:
+                normalized_to_original[canonical] = original
+
         for required_col, description in cls.REQUIRED_COLUMNS.items():
             matches = cls._find_matching_columns(required_col, actual_columns)
             if not matches:
+                matches = cls._find_matching_columns_normalized(required_col, norm_result)
+            if not matches:
                 similar = cls._find_similar_columns(required_col, actual_columns)
+                similar_norm = cls._find_similar_normalized(required_col, norm_result)
+                all_similar = list(dict.fromkeys(similar + similar_norm))
                 suggestion = f"请添加 '{required_col}' 列（{description}）"
-                if similar:
-                    suggestion += f"，是否是列名拼写错误？相似列名: {', '.join(similar)}"
+                if all_similar:
+                    suggestion += f"，是否是列名拼写错误？相似列名: {', '.join('「' + s + '」' for s in all_similar)}"
                 errors.append(ValidationError(
                     code="MISSING_REQUIRED_COLUMN",
                     message=f"缺少必填列: '{required_col}'（{description}）",
@@ -217,16 +250,18 @@ class SchemaValidator:
 
         if expected_columns:
             for exp_col in expected_columns:
-                if exp_col not in actual_columns:
-                    similar = cls._find_similar_columns(exp_col, actual_columns)
-                    suggestion = f"请确认列名是否正确"
-                    if similar:
-                        suggestion += f"，相似列名: {', '.join(similar)}"
-                    errors.append(ValidationError(
-                        code="MISSING_EXPECTED_COLUMN",
-                        message=f"缺少期望的列: '{exp_col}'",
-                        suggestion=suggestion,
-                    ))
+                if exp_col not in actual_columns and normalize_column_name(exp_col) not in norm_result.mapping.get(exp_col, exp_col):
+                    norm_match = [o for o, c in norm_result.mapping.items() if c == normalize_column_name(exp_col)]
+                    if not norm_match:
+                        similar = cls._find_similar_columns(exp_col, actual_columns)
+                        suggestion = "请确认列名是否正确"
+                        if similar:
+                            suggestion += f"，相似列名: {', '.join('「' + s + '」' for s in similar)}"
+                        errors.append(ValidationError(
+                            code="MISSING_EXPECTED_COLUMN",
+                            message=f"缺少期望的列: '{exp_col}'",
+                            suggestion=suggestion,
+                        ))
 
         recognized_cols = set()
         for std_name, patterns in cls.RECOGNIZED_COLUMN_PATTERNS.items():
@@ -234,9 +269,14 @@ class SchemaValidator:
                 if cls._column_matches_patterns(actual_col, patterns):
                     recognized_cols.add(actual_col)
 
+        for original, canonical in norm_result.mapping.items():
+            if canonical in cls.RECOGNIZED_COLUMN_PATTERNS or canonical in {"respondent_id", "duration_seconds", "start_time", "end_time", "submit_time"}:
+                recognized_cols.add(original)
+
         question_cols = [
             col for col in actual_columns
             if any(re.match(p, col) for p in cls.QUESTION_PREFIX_PATTERNS)
+            or any(re.match(p, normalize_column_name(col)) for p in cls.QUESTION_PREFIX_PATTERNS)
         ]
         recognized_cols.update(question_cols)
 
@@ -244,7 +284,7 @@ class SchemaValidator:
         if unrecognized:
             warnings.append(ValidationError(
                 code="UNRECOGNIZED_COLUMNS",
-                message=f"未识别用途的列: {', '.join(unrecognized)}",
+                message=f"未识别用途的列: {', '.join('「' + c + '」' for c in unrecognized)}",
                 suggestion="这些列将自动作为问卷题目处理，如果是人口统计学属性，请重命名为 age、gender 等标准名称",
                 severity="warning",
             ))
@@ -261,18 +301,18 @@ class SchemaValidator:
         duplicate_cols = []
         seen = set()
         for col in actual_columns:
-            lower = col.lower()
+            lower = col.lower().replace(" ", "").replace("-", "").replace("_", "")
             if lower in seen:
                 duplicate_cols.append(col)
             seen.add(lower)
         if duplicate_cols:
             errors.append(ValidationError(
                 code="DUPLICATE_COLUMNS",
-                message=f"存在重复列名（不区分大小写）: {', '.join(duplicate_cols)}",
+                message=f"存在重复列名（不区分大小写/空格/下划线）: {', '.join(duplicate_cols)}",
                 suggestion="请重命名重复的列",
             ))
 
-        return errors, warnings
+        return errors, warnings, norm_result
 
     @classmethod
     def _find_matching_columns(cls, std_name: str, actual_columns: list[str]) -> list[str]:
@@ -280,8 +320,13 @@ class SchemaValidator:
         return [col for col in actual_columns if cls._column_matches_patterns(col, patterns)]
 
     @classmethod
+    def _find_matching_columns_normalized(cls, std_name: str, norm_result: NormalizationResult) -> list[str]:
+        canonical = normalize_column_name(std_name)
+        return [original for original, c in norm_result.mapping.items() if c == canonical]
+
+    @classmethod
     def _column_matches_patterns(cls, col_name: str, patterns: list[str]) -> bool:
-        col_lower = col_name.lower()
+        col_lower = col_name.lower().replace(" ", "").replace("-", "_")
         for pattern in patterns:
             if re.search(pattern, col_lower, re.IGNORECASE):
                 return True
@@ -290,20 +335,33 @@ class SchemaValidator:
     @classmethod
     def _find_similar_columns(cls, target: str, candidates: list[str], max_distance: int = 3) -> list[str]:
         similar = []
-        target_lower = target.lower()
+        target_norm = normalize_column_name(target)
+        target_lower = target.lower().replace(" ", "").replace("-", "").replace("_", "")
+
         for candidate in candidates:
-            cand_lower = candidate.lower()
+            cand_norm = normalize_column_name(candidate)
+            if target_norm == cand_norm and target != candidate:
+                similar.append(candidate)
+                continue
+
+            cand_lower = candidate.lower().replace(" ", "").replace("-", "").replace("_", "")
             distance = cls._levenshtein_distance(target_lower, cand_lower)
             if distance <= max_distance and distance > 0:
                 similar.append(candidate)
 
         for candidate in candidates:
-            cand_lower = candidate.lower()
+            cand_lower = candidate.lower().replace(" ", "").replace("-", "").replace("_", "")
             if target_lower in cand_lower or cand_lower in target_lower:
                 if candidate not in similar:
                     similar.append(candidate)
 
         return similar[:5]
+
+    @classmethod
+    def _find_similar_normalized(cls, target: str, norm_result: NormalizationResult) -> list[str]:
+        target_norm = normalize_column_name(target)
+        return [original for original, canonical in norm_result.mapping.items()
+                if canonical == target_norm and original != target]
 
     @staticmethod
     def _levenshtein_distance(a: str, b: str) -> int:

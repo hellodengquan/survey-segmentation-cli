@@ -1,5 +1,6 @@
 import pandas as pd
 import logging
+from collections import Counter
 
 from .config import SegmentConfig
 
@@ -68,6 +69,14 @@ def auto_segment(df: pd.DataFrame, col_types: dict, config: SegmentConfig = None
     return segment_by_columns(df, selected)
 
 
+def segment_chunk(chunk: pd.DataFrame, segment_cols: list[str]) -> pd.DataFrame:
+    if not segment_cols:
+        chunk = chunk.copy()
+        chunk["_群组"] = "全部受访者"
+        return chunk
+    return segment_by_columns(chunk, segment_cols)
+
+
 def get_segment_summary(df: pd.DataFrame) -> pd.DataFrame:
     if "_群组" not in df.columns:
         raise ValueError("数据尚未分群，请先调用 segment_by_columns 或 auto_segment")
@@ -82,3 +91,34 @@ def get_segment_summary(df: pd.DataFrame) -> pd.DataFrame:
     summary = summary.sort_values("人数", ascending=False).reset_index(drop=True)
     logger.info("分群汇总:\n%s", summary.to_string(index=False))
     return summary
+
+
+class IncrementalSegmentCounter:
+    def __init__(self):
+        self._counter: Counter = Counter()
+        self._total: int = 0
+
+    def update(self, chunk: pd.DataFrame, segment_col: str = "_群组"):
+        if segment_col not in chunk.columns:
+            self._counter["全部受访者"] += len(chunk)
+            self._total += len(chunk)
+            return
+
+        counts = chunk[segment_col].value_counts()
+        for group, count in counts.items():
+            self._counter[str(group)] += count
+        self._total += len(chunk)
+
+    def to_dataframe(self) -> pd.DataFrame:
+        if not self._counter:
+            return pd.DataFrame(columns=["_群组", "人数", "占比"])
+
+        rows = []
+        for group, count in self._counter.most_common():
+            rows.append({
+                "_群组": group,
+                "人数": count,
+                "占比": f"{round(count / self._total * 100, 1)}%",
+            })
+
+        return pd.DataFrame(rows)

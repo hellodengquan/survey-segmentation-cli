@@ -3,6 +3,7 @@ import re
 import logging
 
 from .config import CleaningConfig
+from .column_normalizer import normalize_columns, apply_column_normalization, NormalizationResult
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +61,43 @@ def clean_survey_data(
     return df
 
 
+def clean_chunk(
+    chunk: pd.DataFrame,
+    config: CleaningConfig,
+    id_col: str = "respondent_id",
+) -> pd.DataFrame:
+    chunk = chunk.copy()
+
+    if config.trim_whitespace:
+        str_cols = chunk.select_dtypes(include=["object"]).columns
+        for col in str_cols:
+            chunk[col] = chunk[col].apply(lambda x: x.strip() if isinstance(x, str) else x)
+
+    if config.lowercase_strings:
+        str_cols = chunk.select_dtypes(include=["object"]).columns
+        for col in str_cols:
+            chunk[col] = chunk[col].apply(lambda x: x.lower() if isinstance(x, str) else x)
+
+    if config.standardize_yes_no:
+        chunk = _standardize_yes_no(chunk)
+    chunk = _standardize_na_values(chunk)
+
+    num_cols = chunk.select_dtypes(include=["number"]).columns
+    for col in num_cols:
+        chunk[col] = chunk[col].fillna(config.fill_na_numeric)
+
+    if config.drop_empty_rows:
+        chunk = _drop_mostly_empty(chunk, threshold=config.empty_threshold)
+
+    return chunk
+
+
+def normalize_dataframe_columns(df: pd.DataFrame) -> tuple[pd.DataFrame, NormalizationResult]:
+    norm_result = normalize_columns(list(df.columns))
+    df = apply_column_normalization(df, norm_result)
+    return df, norm_result
+
+
 def _standardize_yes_no(df: pd.DataFrame) -> pd.DataFrame:
     yes_pattern = re.compile(r"^(yes|是|y|true|1|对|同意)$", re.IGNORECASE)
     no_pattern = re.compile(r"^(no|否|n|false|0|错|不同意)$", re.IGNORECASE)
@@ -104,7 +142,6 @@ def identify_column_types(df: pd.DataFrame, id_col: str = "respondent_id") -> di
         for kw in keywords:
             if kw in col_lower:
                 if len(kw) <= 3:
-                    import re
                     if re.search(rf'\b{re.escape(kw)}\b', col_lower):
                         return True
                 else:
