@@ -15,7 +15,7 @@ from .anomaly import detect_anomalies, detect_chunk_anomalies, detect_global_ano
 from .report import generate_report
 from .schema_validator import SchemaValidator, ValidationResult
 from .config import load_config, get_available_survey_types, AppConfig
-from .column_normalizer import apply_column_normalization, normalize_columns
+from .column_normalizer import apply_column_normalization, normalize_columns, AliasRegistry
 
 
 def setup_logging(verbose: bool = False):
@@ -96,6 +96,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="分块读取大小（行数），启用后流式处理大文件避免内存溢出。仅在 CSV 格式下生效",
+    )
+    basic_group.add_argument(
+        "--alias-config",
+        default=None,
+        help="列名别名配置文件路径（JSON 格式），用于自定义中英文列名映射",
     )
 
     anomaly_group = parser.add_argument_group("异常检测阈值")
@@ -374,7 +379,10 @@ def _run_chunked(args: argparse.Namespace, config: AppConfig, logger: logging.Lo
     col_types = identify_column_types(cleaned_chunks[0] if cleaned_chunks else pd.DataFrame(), id_col=config.id_col) if cleaned_chunks else {"id": [], "demographic": [], "question": [], "timing": [], "other": []}
     question_cols = col_types.get("question", [])
 
-    distributions = merge_chunk_counts(chunk_counts_list, total_rows)
+    if full_df is not None:
+        distributions = compute_question_distribution(full_df, question_cols)
+    else:
+        distributions = merge_chunk_counts(chunk_counts_list, total_rows)
 
     if full_df is not None and config.report.include_cross_tabs:
         if "_群组" not in full_df.columns and config.segment.segment_cols:
@@ -556,6 +564,15 @@ def run(args: argparse.Namespace):
         cli_overrides=cli_overrides,
     )
     logger.info("使用问卷类型预设: %s", config.survey_type)
+
+    if not args.no_normalize_columns:
+        if args.alias_config:
+            registry = AliasRegistry.get_instance()
+            registry.reload_from_file(args.alias_config)
+            logger.info("已从 %s 加载自定义别名配置", args.alias_config)
+        else:
+            from .column_normalizer import load_default_aliases
+            load_default_aliases()
 
     use_chunked = (
         args.chunk_size is not None

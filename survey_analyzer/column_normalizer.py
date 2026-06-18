@@ -1,11 +1,12 @@
 import re
+import json
+import os
 import logging
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
-
-CHINESE_ENGLISH_ALIASES = {
+_BUILTIN_CHINESE_ENGLISH_ALIASES = {
     "受访者id": "respondent_id",
     "受访者_id": "respondent_id",
     "回答者id": "respondent_id",
@@ -36,7 +37,7 @@ CHINESE_ENGLISH_ALIASES = {
     "提交时间": "submit_time",
 }
 
-CANONICAL_NAMES = {
+_BUILTIN_CANONICAL_NAMES = {
     "respondent_id": "respondent_id",
     "resp_id": "respondent_id",
     "respid": "respondent_id",
@@ -72,6 +73,74 @@ CANONICAL_NAMES = {
 }
 
 
+class AliasRegistry:
+    _instance = None
+
+    def __init__(self):
+        self._chinese_english_aliases = dict(_BUILTIN_CHINESE_ENGLISH_ALIASES)
+        self._canonical_names = dict(_BUILTIN_CANONICAL_NAMES)
+
+    @classmethod
+    def get_instance(cls) -> "AliasRegistry":
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    @classmethod
+    def reset(cls):
+        cls._instance = None
+
+    @property
+    def chinese_english_aliases(self) -> dict[str, str]:
+        return self._chinese_english_aliases
+
+    @property
+    def canonical_names(self) -> dict[str, str]:
+        return self._canonical_names
+
+    def load_from_file(self, filepath: str) -> bool:
+        if not os.path.exists(filepath):
+            logger.warning("别名配置文件不存在: %s，使用内置默认别名", filepath)
+            return False
+
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except json.JSONDecodeError as e:
+            logger.error("别名配置文件 JSON 解析失败: %s", e)
+            return False
+        except Exception as e:
+            logger.error("读取别名配置文件失败: %s", e)
+            return False
+
+        custom_aliases = data.get("chinese_english_aliases", {})
+        custom_canonical = data.get("canonical_names", {})
+
+        if not isinstance(custom_aliases, dict) or not isinstance(custom_canonical, dict):
+            logger.error("别名配置文件格式错误: chinese_english_aliases 和 canonical_names 必须是字典")
+            return False
+
+        self._chinese_english_aliases.update(custom_aliases)
+        self._canonical_names.update(custom_canonical)
+
+        logger.info("已从 %s 加载别名配置: 中英文别名 %d 条，标准名映射 %d 条",
+                    filepath, len(custom_aliases), len(custom_canonical))
+        return True
+
+    def reload_from_file(self, filepath: str) -> bool:
+        self._chinese_english_aliases = dict(_BUILTIN_CHINESE_ENGLISH_ALIASES)
+        self._canonical_names = dict(_BUILTIN_CANONICAL_NAMES)
+        return self.load_from_file(filepath)
+
+
+def load_default_aliases():
+    default_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "default_aliases.json")
+    registry = AliasRegistry.get_instance()
+    if os.path.exists(default_path):
+        registry.load_from_file(default_path)
+    return registry
+
+
 @dataclass
 class NormalizationResult:
     mapping: dict[str, str] = field(default_factory=dict)
@@ -80,6 +149,8 @@ class NormalizationResult:
 
 
 def normalize_column_name(col: str) -> str:
+    registry = AliasRegistry.get_instance()
+
     normalized = col.strip()
     normalized = re.sub(r'[\s\u3000]+', '_', normalized)
     normalized = re.sub(r'[-—_]+', '_', normalized)
@@ -87,25 +158,25 @@ def normalize_column_name(col: str) -> str:
     normalized = normalized.strip('_')
     normalized = normalized.lower()
 
-    if normalized in CHINESE_ENGLISH_ALIASES:
-        return CHINESE_ENGLISH_ALIASES[normalized]
+    if normalized in registry.chinese_english_aliases:
+        return registry.chinese_english_aliases[normalized]
 
     parts = normalized.split('_')
-    chinese_parts = []
+    mapped_parts = []
     for part in parts:
-        if part in CHINESE_ENGLISH_ALIASES:
-            chinese_parts.append(CHINESE_ENGLISH_ALIASES[part])
+        if part in registry.chinese_english_aliases:
+            mapped_parts.append(registry.chinese_english_aliases[part])
         else:
-            chinese_parts.append(part)
+            mapped_parts.append(part)
 
-    if chinese_parts != parts:
-        rejoined = '_'.join(chinese_parts)
-        if rejoined in CANONICAL_NAMES:
-            return CANONICAL_NAMES[rejoined]
+    if mapped_parts != parts:
+        rejoined = '_'.join(mapped_parts)
+        if rejoined in registry.canonical_names:
+            return registry.canonical_names[rejoined]
         return rejoined
 
-    if normalized in CANONICAL_NAMES:
-        return CANONICAL_NAMES[normalized]
+    if normalized in registry.canonical_names:
+        return registry.canonical_names[normalized]
 
     return normalized
 

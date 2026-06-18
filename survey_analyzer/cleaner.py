@@ -149,6 +149,8 @@ def identify_column_types(df: pd.DataFrame, id_col: str = "respondent_id") -> di
         return False
 
     for col in df.columns:
+        if col.startswith("_"):
+            continue
         col_lower = col.lower()
         if col == id_col:
             col_types["id"].append(col)

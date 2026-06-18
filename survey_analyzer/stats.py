@@ -12,7 +12,8 @@ def compute_question_distribution(df: pd.DataFrame, question_cols: list[str]) ->
             logger.warning("列 '%s' 不存在，跳过", col)
             continue
 
-        counts = df[col].value_counts(dropna=False)
+        na_count = int(df[col].isna().sum())
+        counts = df[col].value_counts(dropna=True)
         total = len(df)
 
         dist = pd.DataFrame({
@@ -24,7 +25,6 @@ def compute_question_distribution(df: pd.DataFrame, question_cols: list[str]) ->
         dist["累计占比"] = dist["占比"].cumsum().round(1).astype(str) + "%"
         dist = dist.reset_index(drop=True)
 
-        na_count = int(df[col].isna().sum())
         if na_count > 0:
             dist.loc[len(dist)] = {
                 "选项": "（缺失值）",

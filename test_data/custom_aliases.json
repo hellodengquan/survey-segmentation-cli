@@ -1,0 +1,9 @@
+{
+  "chinese_english_aliases": {
+    "受访者编号": "respondent_id",
+    "填写耗时": "duration_seconds"
+  },
+  "canonical_names": {
+    "respno": "respondent_id"
+  }
+}
