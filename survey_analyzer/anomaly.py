@@ -2,6 +2,8 @@ import pandas as pd
 import numpy as np
 import logging
 
+from .config import AnomalyThresholds
+
 logger = logging.getLogger(__name__)
 
 
@@ -10,11 +12,11 @@ def detect_anomalies(
     question_cols: list[str],
     id_col: str = "respondent_id",
     time_col: str = "duration_seconds",
-    speed_threshold_seconds: float = 60,
-    straight_line_min_cols: int = 5,
-    straight_line_ratio: float = 0.9,
-    contradiction_pairs: list[tuple[str, str, set]] = None,
+    thresholds: AnomalyThresholds = None,
 ) -> pd.DataFrame:
+    if thresholds is None:
+        thresholds = AnomalyThresholds()
+
     anomaly_records = []
 
     if id_col not in df.columns:
@@ -23,20 +25,34 @@ def detect_anomalies(
 
     valid_q_cols = [c for c in question_cols if c in df.columns]
 
-    speed_anomalies = _detect_speeding(df, id_col, time_col, speed_threshold_seconds)
+    speed_anomalies = _detect_speeding(
+        df, id_col, time_col, thresholds.speed_threshold_seconds
+    )
     anomaly_records.extend(speed_anomalies)
 
-    straight_anomalies = _detect_straight_lining(df, id_col, valid_q_cols, straight_line_min_cols, straight_line_ratio)
+    straight_anomalies = _detect_straight_lining(
+        df, id_col, valid_q_cols,
+        thresholds.straight_line_min_cols,
+        thresholds.straight_line_ratio,
+    )
     anomaly_records.extend(straight_anomalies)
 
-    pattern_anomalies = _detect_pattern_answers(df, id_col, valid_q_cols)
+    pattern_anomalies = _detect_pattern_answers(
+        df, id_col, valid_q_cols, thresholds.pattern_min_cols
+    )
     anomaly_records.extend(pattern_anomalies)
 
-    if contradiction_pairs:
-        contra_anomalies = _detect_contradictions(df, id_col, contradiction_pairs)
+    if thresholds.contradiction_pairs:
+        contra_anomalies = _detect_contradictions(
+            df, id_col, thresholds.contradiction_pairs
+        )
         anomaly_records.extend(contra_anomalies)
 
-    outlier_anomalies = _detect_numeric_outliers(df, id_col, valid_q_cols)
+    outlier_anomalies = _detect_numeric_outliers(
+        df, id_col, valid_q_cols,
+        thresholds.numeric_outlier_iqr_multiplier,
+        thresholds.numeric_outlier_min_rows,
+    )
     anomaly_records.extend(outlier_anomalies)
 
     if not anomaly_records:
@@ -67,7 +83,7 @@ def _detect_speeding(
             "异常类型": "作答过快",
             "异常详情": f"作答时长仅 {row[time_col]:.0f} 秒（低于 {threshold:.0f} 秒阈值）",
         })
-    logger.info("检测到 %d 条作答过快记录", len(records))
+    logger.info("检测到 %d 条作答过快记录（阈值 %.0f 秒）", len(records), threshold)
     return records
 
 
@@ -91,7 +107,8 @@ def _detect_straight_lining(
     if len(cat_cols) < min_cols and len(num_cols) < min_cols and len(question_cols) >= min_cols:
         _check_straight_for_cols(df, id_col, question_cols, min_cols, ratio, "", records)
 
-    logger.info("检测到 %d 条直线作答记录", len(records))
+    logger.info("检测到 %d 条直线作答记录（≥%d 题，一致率≥%.0f%%）",
+                len(records), min_cols, ratio * 100)
     return records
 
 
@@ -130,15 +147,17 @@ def _detect_pattern_answers(
     df: pd.DataFrame,
     id_col: str,
     question_cols: list[str],
+    min_cols: int,
 ) -> list[dict]:
     records = []
-    if len(question_cols) < 4:
+    if len(question_cols) < min_cols:
+        logger.info("题目数少于 %d，跳过规律性作答检测", min_cols)
         return records
 
     q_data = df[question_cols]
     for idx, row in q_data.iterrows():
         non_na = row.dropna()
-        if len(non_na) < 4:
+        if len(non_na) < min_cols:
             continue
 
         vals = list(non_na.values)
@@ -154,17 +173,26 @@ def _detect_pattern_answers(
                 "异常类型": "规律性作答",
                 "异常详情": f"连续 {len(numeric_vals)} 道题呈等差规律（步长={diffs[0]:.1f}）",
             })
-    logger.info("检测到 %d 条规律性作答记录", len(records))
+    logger.info("检测到 %d 条规律性作答记录（≥%d 题）", len(records), min_cols)
     return records
 
 
 def _detect_contradictions(
     df: pd.DataFrame,
     id_col: str,
-    pairs: list[tuple[str, str, set]],
+    pairs: list,
 ) -> list[dict]:
     records = []
-    for col1, col2, contradiction_set in pairs:
+    for pair in pairs:
+        if len(pair) == 3:
+            col1, col2, contradiction_set = pair
+        elif len(pair) == 2:
+            col1, col2 = pair
+            contradiction_set = {("非常满意", "肯定不会"), ("非常满意", "从不"),
+                                 ("非常不满意", "肯定会"), ("非常不满意", "总是")}
+        else:
+            continue
+
         if col1 not in df.columns or col2 not in df.columns:
             logger.warning("矛盾检测: 列 '%s' 或 '%s' 不存在", col1, col2)
             continue
@@ -190,13 +218,15 @@ def _detect_numeric_outliers(
     df: pd.DataFrame,
     id_col: str,
     question_cols: list[str],
+    iqr_multiplier: float,
+    min_rows: int,
 ) -> list[dict]:
     records = []
     numeric_cols = [c for c in question_cols if c in df.columns and pd.api.types.is_numeric_dtype(df[c])]
 
     for col in numeric_cols:
         series = df[col].dropna()
-        if len(series) < 10:
+        if len(series) < min_rows:
             continue
 
         q1 = series.quantile(0.25)
@@ -205,17 +235,18 @@ def _detect_numeric_outliers(
         if iqr == 0:
             continue
 
-        lower = q1 - 3 * iqr
-        upper = q3 + 3 * iqr
+        lower = q1 - iqr_multiplier * iqr
+        upper = q3 + iqr_multiplier * iqr
 
         outliers = df[(df[col] < lower) | (df[col] > upper)]
         for idx, row in outliers.iterrows():
             records.append({
                 "受访者ID": row[id_col],
                 "异常类型": "数值异常",
-                "异常详情": f"「{col}」={row[col]:.2f}（正常范围 {lower:.2f}~{upper:.2f}）",
+                "异常详情": f"「{col}」={row[col]:.2f}（正常范围 {lower:.2f}~{upper:.2f}，IQR×{iqr_multiplier}）",
             })
-    logger.info("检测到 %d 条数值异常记录", len(records))
+    logger.info("检测到 %d 条数值异常记录（IQR×%.1f，≥%d 行）",
+                len(records), iqr_multiplier, min_rows)
     return records
 
 
@@ -237,7 +268,7 @@ def get_anomaly_summary(anomaly_df: pd.DataFrame) -> pd.DataFrame:
         "直线作答": "受访者对大量题目选择了相同答案，可能存在敷衍行为",
         "规律性作答": "受访者的答案呈明显等差规律，可能为随意填答",
         "矛盾回答": "受访者在不同题目中的回答存在逻辑矛盾",
-        "数值异常": "受访者的数值回答远超正常范围（3倍四分位距之外）",
+        "数值异常": "受访者的数值回答远超正常范围",
     }
 
     summary["说明"] = summary["异常类型"].map(type_descriptions).fillna("需要研究员复核")

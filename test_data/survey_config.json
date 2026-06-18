@@ -1,0 +1,47 @@
+{
+  "survey_type": "likert7",
+  "id_col": "respondent_id",
+  "time_col": "duration_seconds",
+  "encoding": "utf-8",
+
+  "anomaly": {
+    "speed_threshold_seconds": 90.0,
+    "straight_line_min_cols": 3,
+    "straight_line_ratio": 0.85,
+    "pattern_min_cols": 5,
+    "numeric_outlier_iqr_multiplier": 3.0,
+    "numeric_outlier_min_rows": 10,
+    "contradiction_pairs": [
+      ["Q1_整体满意度", "Q2_推荐意愿", [
+        ["非常满意", "肯定不会"],
+        ["非常满意", "从不"],
+        ["非常不满意", "肯定会"],
+        ["非常不满意", "总是"]
+      ]]
+    ]
+  },
+
+  "cleaning": {
+    "trim_whitespace": true,
+    "lowercase_strings": true,
+    "standardize_yes_no": true,
+    "drop_empty_rows": true,
+    "empty_threshold": 0.7,
+    "fill_na_numeric": -1.0
+  },
+
+  "segment": {
+    "auto_segment": true,
+    "segment_cols": [],
+    "max_groups": 15,
+    "min_categories": 2,
+    "max_categories": 8
+  },
+
+  "report": {
+    "include_cross_tabs": true,
+    "include_numeric_summary": true,
+    "include_anomalies": true,
+    "include_raw_data": true
+  }
+}

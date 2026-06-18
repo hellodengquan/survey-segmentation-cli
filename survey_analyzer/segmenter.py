@@ -1,6 +1,8 @@
 import pandas as pd
 import logging
 
+from .config import SegmentConfig
+
 logger = logging.getLogger(__name__)
 
 
@@ -28,7 +30,10 @@ def segment_by_columns(df: pd.DataFrame, segment_cols: list[str]) -> pd.DataFram
     return df
 
 
-def auto_segment(df: pd.DataFrame, col_types: dict, max_groups: int = 15) -> pd.DataFrame:
+def auto_segment(df: pd.DataFrame, col_types: dict, config: SegmentConfig = None) -> pd.DataFrame:
+    if config is None:
+        config = SegmentConfig()
+
     demo_cols = col_types.get("demographic", [])
     if not demo_cols:
         logger.info("未识别到人口统计学列，将整体作为一个群组")
@@ -39,7 +44,7 @@ def auto_segment(df: pd.DataFrame, col_types: dict, max_groups: int = 15) -> pd.
     candidates = []
     for col in demo_cols:
         nunique = df[col].nunique()
-        if 2 <= nunique <= 8:
+        if config.min_categories <= nunique <= config.max_categories:
             candidates.append((col, nunique))
 
     candidates.sort(key=lambda x: x[1])
@@ -47,7 +52,7 @@ def auto_segment(df: pd.DataFrame, col_types: dict, max_groups: int = 15) -> pd.
     selected = []
     estimated_groups = 1
     for col, nunique in candidates:
-        if estimated_groups * nunique > max_groups:
+        if estimated_groups * nunique > config.max_groups:
             break
         selected.append(col)
         estimated_groups *= nunique

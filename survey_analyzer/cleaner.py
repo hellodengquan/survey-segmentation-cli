@@ -2,6 +2,8 @@ import pandas as pd
 import re
 import logging
 
+from .config import CleaningConfig
+
 logger = logging.getLogger(__name__)
 
 
@@ -9,39 +11,46 @@ def clean_survey_data(
     df: pd.DataFrame,
     id_col: str = "respondent_id",
     time_col: str = "duration_seconds",
-    drop_empty_rows: bool = True,
-    empty_threshold: float = 0.7,
-    trim_whitespace: bool = True,
-    lowercase_strings: bool = True,
-    fill_na_numeric: float = -1,
+    config: CleaningConfig = None,
+    **kwargs,
 ) -> pd.DataFrame:
+    if config is None:
+        config = CleaningConfig(
+            drop_empty_rows=kwargs.get("drop_empty_rows", True),
+            empty_threshold=kwargs.get("empty_threshold", 0.7),
+            trim_whitespace=kwargs.get("trim_whitespace", True),
+            lowercase_strings=kwargs.get("lowercase_strings", True),
+            fill_na_numeric=kwargs.get("fill_na_numeric", -1),
+        )
+
     logger.info("开始清洗问卷数据，原始行数: %d，列数: %d", len(df), len(df.columns))
 
     df = df.copy()
 
-    if trim_whitespace:
+    if config.trim_whitespace:
         str_cols = df.select_dtypes(include=["object"]).columns
         for col in str_cols:
             df[col] = df[col].apply(lambda x: x.strip() if isinstance(x, str) else x)
         logger.info("已清理字符串列的前后空白，涉及 %d 列", len(str_cols))
 
-    if lowercase_strings:
+    if config.lowercase_strings:
         str_cols = df.select_dtypes(include=["object"]).columns
         for col in str_cols:
             df[col] = df[col].apply(lambda x: x.lower() if isinstance(x, str) else x)
         logger.info("已将字符串列转为小写，涉及 %d 列", len(str_cols))
 
-    df = _standardize_yes_no(df)
+    if config.standardize_yes_no:
+        df = _standardize_yes_no(df)
     df = _standardize_na_values(df)
 
     num_cols = df.select_dtypes(include=["number"]).columns
     for col in num_cols:
-        df[col] = df[col].fillna(fill_na_numeric)
+        df[col] = df[col].fillna(config.fill_na_numeric)
 
-    if drop_empty_rows:
+    if config.drop_empty_rows:
         before = len(df)
-        df = _drop_mostly_empty(df, threshold=empty_threshold)
-        logger.info("删除缺失率超过 %.0f%% 的行: %d -> %d", empty_threshold * 100, before, len(df))
+        df = _drop_mostly_empty(df, threshold=config.empty_threshold)
+        logger.info("删除缺失率超过 %.0f%% 的行: %d -> %d", config.empty_threshold * 100, before, len(df))
 
     if id_col in df.columns:
         df = df.drop_duplicates(subset=[id_col])
