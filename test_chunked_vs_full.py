@@ -2,6 +2,8 @@ import sys
 import os
 import json
 import pandas as pd
+import numpy as np
+import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
 
@@ -415,6 +417,321 @@ def test_alias_config():
     return 0 if all_pass else 1
 
 
+SAMPLE_COLUMNS = [
+    "respondent_id", "age", "gender", "region", "education", "duration_seconds",
+    "Q1_整体满意度", "Q2_推荐意愿", "Q3_使用频率", "Q4_是否购买",
+    "Q5_界面满意度", "Q6_功能满意度", "Q7_体验评分", "Q8_性价比评分", "Q9_复购意愿",
+]
+
+Q_OPTIONS = {
+    "Q1_整体满意度": ["非常满意", "满意", "一般", "不满意", "非常不满意"],
+    "Q2_推荐意愿": ["肯定会", "可能会", "不确定", "可能不会", "肯定不会"],
+    "Q3_使用频率": ["总是", "经常", "偶尔", "很少", "从不"],
+    "Q4_是否购买": ["是", "否"],
+    "Q5_界面满意度": ["非常满意", "满意", "一般", "不满意", "非常不满意"],
+    "Q6_功能满意度": ["肯定会", "可能会", "不确定", "可能不会", "肯定不会"],
+    "Q7_体验评分": [str(x) for x in range(1, 11)],
+    "Q8_性价比评分": [str(x) for x in range(1, 11)],
+    "Q9_复购意愿": ["总是", "经常", "偶尔", "很少", "从不"],
+}
+
+
+def _generate_normal_row(rid: str, rng: np.random.Generator) -> dict:
+    ages = ["18-25", "26-35", "36-45", "46-55", "55+"]
+    genders = ["男", "女", "其他"]
+    regions = ["北京", "上海", "广州", "深圳", "杭州", "成都", "武汉", "西安"]
+    educations = ["高中及以下", "大专", "本科", "硕士及以上"]
+
+    row = {
+        "respondent_id": rid,
+        "age": rng.choice(ages),
+        "gender": rng.choice(genders),
+        "region": rng.choice(regions),
+        "education": rng.choice(educations),
+        "duration_seconds": int(rng.integers(100, 800)),
+    }
+    for q, opts in Q_OPTIONS.items():
+        row[q] = rng.choice(opts)
+    return row
+
+
+def _generate_short_duration_row(rid: str, rng: np.random.Generator) -> dict:
+    row = _generate_normal_row(rid, rng)
+    row["duration_seconds"] = int(rng.integers(1, 9))
+    return row
+
+
+def _generate_missing_answers_row(rid: str, rng: np.random.Generator, missing_ratio: float = 0.6) -> dict:
+    row = _generate_normal_row(rid, rng)
+    q_cols = list(Q_OPTIONS.keys())
+    n_missing = int(len(q_cols) * missing_ratio)
+    miss_cols = rng.choice(q_cols, size=n_missing, replace=False)
+    for col in miss_cols:
+        row[col] = ""
+    return row
+
+
+def build_cross_chunk_duplicate_data(n_unique: int = 20) -> str:
+    """
+    构造跨 chunk 重复被试数据：每个被试有 2 行回答，所有第 1 次回答在前，所有第 2 次回答在后。
+    当 chunk_size = n_unique 时，第 i 块和第 i+1 块包含同一被试的不同回答。
+    """
+    rng = np.random.default_rng(42)
+    rows = []
+    for i in range(1, n_unique + 1):
+        rid = f"R{i:03d}"
+        rows.append(_generate_normal_row(rid, rng))
+    for i in range(1, n_unique + 1):
+        rid = f"R{i:03d}"
+        rows.append(_generate_normal_row(rid, rng))
+
+    path = os.path.join(tempfile.gettempdir(), f"cross_chunk_dup_{n_unique}.csv")
+    df = pd.DataFrame(rows, columns=SAMPLE_COLUMNS)
+    df.to_csv(path, index=False, encoding="utf-8")
+    return path
+
+
+def _generate_straight_lining_row(rid: str, rng: np.random.Generator) -> dict:
+    """生成直线答题（所有题选同一个选项）的行"""
+    row = _generate_normal_row(rid, rng)
+    single_option = rng.choice(["非常满意", "满意", "一般", "5"])
+    for q in Q_OPTIONS:
+        if "评分" in q:
+            row[q] = "5"
+        else:
+            row[q] = single_option if single_option in Q_OPTIONS[q] else Q_OPTIONS[q][0]
+    return row
+
+
+def build_high_anomaly_data(n_rows: int = 100, anomaly_ratio: float = 0.8) -> str:
+    """构造高异常占比数据（默认 80% 异常）"""
+    rng = np.random.default_rng(7)
+    rows = []
+    n_anomaly = int(n_rows * anomaly_ratio)
+    n_normal = n_rows - n_anomaly
+
+    for i in range(n_anomaly):
+        rid = f"R{i:05d}"
+        anomaly_type = i % 3
+        if anomaly_type == 0:
+            rows.append(_generate_short_duration_row(rid, rng))
+        elif anomaly_type == 1:
+            rows.append(_generate_straight_lining_row(rid, rng))
+        else:
+            row = _generate_short_duration_row(rid, rng)
+            row2 = _generate_straight_lining_row(rid, rng)
+            row2["duration_seconds"] = row["duration_seconds"]
+            rows.append(row2)
+
+    for i in range(n_normal):
+        rid = f"R{n_anomaly + i:05d}"
+        rows.append(_generate_normal_row(rid, rng))
+
+    rng.shuffle(rows)
+    for idx, row in enumerate(rows):
+        row["respondent_id"] = f"R{idx:05d}"
+
+    path = os.path.join(tempfile.gettempdir(), f"high_anomaly_{n_rows}.csv")
+    df = pd.DataFrame(rows, columns=SAMPLE_COLUMNS)
+    df.to_csv(path, index=False, encoding="utf-8")
+    return path
+
+
+def build_small_dataset(n_rows: int = 10) -> str:
+    """构造小型数据集（用于 chunk=1 等极端测试）"""
+    rng = np.random.default_rng(99)
+    rows = []
+    for i in range(n_rows):
+        rid = f"R{i:03d}"
+        rows.append(_generate_normal_row(rid, rng))
+
+    path = os.path.join(tempfile.gettempdir(), f"small_{n_rows}.csv")
+    df = pd.DataFrame(rows, columns=SAMPLE_COLUMNS)
+    df.to_csv(path, index=False, encoding="utf-8")
+    return path
+
+
+def build_heavy_duplicate_data(n_unique: int = 10, dup_per_id: int = 5) -> str:
+    """
+    构造大量重复数据：每个被试有 dup_per_id 行回答，打乱顺序。
+    用于测试跨 chunk 去重的极端场景。
+    """
+    rng = np.random.default_rng(123)
+    rows = []
+    for i in range(n_unique):
+        rid = f"R{i:03d}"
+        for _ in range(dup_per_id):
+            rows.append(_generate_normal_row(rid, rng))
+
+    rng.shuffle(rows)
+    path = os.path.join(tempfile.gettempdir(), f"heavy_dup_{n_unique}x{dup_per_id}.csv")
+    df = pd.DataFrame(rows, columns=SAMPLE_COLUMNS)
+    df.to_csv(path, index=False, encoding="utf-8")
+    return path
+
+
+def build_single_row_dataset() -> str:
+    """构造只有 1 行的极端小数据集"""
+    rng = np.random.default_rng(42)
+    row = _generate_normal_row("R001", rng)
+    path = os.path.join(tempfile.gettempdir(), "single_row.csv")
+    df = pd.DataFrame([row], columns=SAMPLE_COLUMNS)
+    df.to_csv(path, index=False, encoding="utf-8")
+    return path
+
+
+def test_extreme_chunk_sizes():
+    """极端 chunk size 测试：1、等于行数、大于行数、单行数据"""
+    print()
+    print("=" * 70)
+    print("边界测试：极端 chunk size")
+    print("=" * 70)
+
+    total_failures = 0
+    expected_notes = []
+
+    data_path = build_small_dataset(n_rows=10)
+    test_cases = [
+        ("chunk_size = 1（每行一块）", data_path, 1),
+        ("chunk_size = 行数（一块正好）", data_path, 10),
+        ("chunk_size > 行数（单块）", data_path, 100),
+    ]
+
+    for label, dp, cs in test_cases:
+        print(f"\n--- {label} ---")
+        rc = run_comparison(dp, chunk_size=cs)
+        if rc != 0:
+            total_failures += 1
+
+    os.remove(data_path)
+
+    single_path = build_single_row_dataset()
+    print(f"\n--- 单行数据 + chunk_size=1 ---")
+    rc = run_comparison(single_path, chunk_size=1)
+    if rc != 0:
+        total_failures += 1
+    os.remove(single_path)
+
+    print()
+    print("=" * 70)
+    if total_failures == 0:
+        print("✅ 极端 chunk size 测试全部通过")
+    else:
+        print(f"❌ 极端 chunk size 测试：{total_failures} 组失败")
+
+    if expected_notes:
+        print("📝 预期差异说明:")
+        for note in expected_notes:
+            print(f"   - {note}")
+
+    return total_failures
+
+
+def test_cross_chunk_duplicates():
+    """跨 chunk 边界重复被试测试"""
+    print()
+    print("=" * 70)
+    print("边界测试：跨 chunk 边界重复被试")
+    print("=" * 70)
+
+    total_failures = 0
+    expected_notes = []
+
+    n_unique = 20
+    data_path = build_cross_chunk_duplicate_data(n_unique=n_unique)
+
+    print(f"场景1: {n_unique} 个唯一被试 × 2 行 = {n_unique * 2} 行")
+    print(f"  chunk_size = {n_unique}（第一块全是首次回答，第二块全是第二次回答）")
+    print()
+    rc = run_comparison(data_path, chunk_size=n_unique)
+    if rc != 0:
+        total_failures += 1
+    os.remove(data_path)
+
+    n_unique2 = 10
+    dup = 5
+    data_path2 = build_heavy_duplicate_data(n_unique=n_unique2, dup_per_id=dup)
+    print(f"\n场景2: {n_unique2} 个唯一被试 × {dup} 行 = {n_unique2 * dup} 行（重度重复）")
+    print(f"  chunk_size = 7（每个被试的多行被分散在不同 chunk 中）")
+    print()
+    rc = run_comparison(data_path2, chunk_size=7)
+    if rc != 0:
+        total_failures += 1
+    os.remove(data_path2)
+
+    print()
+    print("=" * 70)
+    if total_failures == 0:
+        print("✅ 跨 chunk 重复被试测试全部通过")
+    else:
+        print(f"❌ 跨 chunk 重复被试测试：{total_failures} 组失败")
+
+    if expected_notes:
+        print("📝 预期差异说明:")
+        for note in expected_notes:
+            print(f"   - {note}")
+
+    return total_failures
+
+
+def test_high_anomaly_ratio():
+    """高异常占比测试：>70% 异常、100% 异常"""
+    print()
+    print("=" * 70)
+    print("边界测试：高异常占比 (>70%)")
+    print("=" * 70)
+
+    total_failures = 0
+    expected_notes = []
+
+    data_path = build_high_anomaly_data(n_rows=100, anomaly_ratio=0.8)
+    print(f"场景1: 100 行，约 80% 为异常答题")
+    print(f"  chunk_size = 15")
+    print()
+    rc = run_comparison(data_path, chunk_size=15)
+    if rc != 0:
+        total_failures += 1
+    os.remove(data_path)
+
+    data_path2 = build_high_anomaly_data(n_rows=50, anomaly_ratio=1.0)
+    print(f"\n场景2: 50 行，100% 全为异常答题")
+    print(f"  chunk_size = 10")
+    print()
+    rc = run_comparison(data_path2, chunk_size=10)
+    if rc != 0:
+        total_failures += 1
+    os.remove(data_path2)
+
+    print()
+    print("=" * 70)
+    if total_failures == 0:
+        print("✅ 高异常占比测试全部通过")
+    else:
+        print(f"❌ 高异常占比测试：{total_failures} 组失败")
+
+    if expected_notes:
+        print("📝 预期差异说明:")
+        for note in expected_notes:
+            print(f"   - {note}")
+
+    return total_failures
+
+
+def run_boundary_tests():
+    """运行所有边界测试"""
+    print()
+    print()
+    print("╔" + "═" * 68 + "╗")
+    print("║" + " " * 20 + "边 界 测 试 套 件" + " " * 28 + "║")
+    print("╚" + "═" * 68 + "╝")
+
+    exit_code = 0
+    exit_code |= test_extreme_chunk_sizes()
+    exit_code |= test_cross_chunk_duplicates()
+    exit_code |= test_high_anomaly_ratio()
+    return exit_code
+
+
 if __name__ == "__main__":
     exit_code = 0
 
@@ -427,5 +744,7 @@ if __name__ == "__main__":
     big_path = os.path.join(os.path.join(os.path.dirname(os.path.abspath(__file__)), "sample_data", "big_survey_mixed_columns.csv"))
     if os.path.exists(big_path):
         exit_code |= run_comparison(big_path, chunk_size=500)
+
+    exit_code |= run_boundary_tests()
 
     sys.exit(exit_code)
